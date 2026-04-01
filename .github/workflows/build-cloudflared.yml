@@ -1,4 +1,4 @@
-name: Build Cloudflared Docker
+name: Build Cloudflared Docker Test
 
 on:
   schedule:
