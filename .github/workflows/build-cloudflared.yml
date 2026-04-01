@@ -1,0 +1,313 @@
+name: Build Cloudflared Docker
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional upstream cloudflared version (for example: 2026.3.0)"
+        required: false
+        type: string
+      force:
+        description: "Force rebuild even when the published fingerprint matches"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: cloudflared-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: ${{ vars.UPSTREAM_CLOUDFLARED_REPO || 'cloudflare/cloudflared' }}
+  BUILD_POLICY_VERSION: ${{ vars.BUILD_POLICY_VERSION || '1' }}
+  RUNTIME_IMAGE: ${{ vars.CLOUDFLARED_RUNTIME_IMAGE || 'alpine:3.21' }}
+  REQUESTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || '' }}
+  FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force || 'false' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve target version and fingerprint
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image_repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/cloudflared-docker"
+          api_root="https://api.github.com/repos/${UPSTREAM_REPO}/releases"
+
+          latest_json="$(curl -fsSL -H 'Accept: application/vnd.github+json' "${api_root}/latest")"
+          latest_version="$(jq -r '.tag_name' <<<"${latest_json}")"
+
+          if [[ -n "${REQUESTED_VERSION}" ]]; then
+            target_version="${REQUESTED_VERSION}"
+          else
+            target_version="${latest_version}"
+          fi
+
+          release_json="$(curl -fsSL -H 'Accept: application/vnd.github+json' "${api_root}/tags/${target_version}")"
+
+          asset_name_for() {
+            local key="$1"
+            case "${key}" in
+              amd64) echo "cloudflared-linux-amd64" ;;
+              arm64) echo "cloudflared-linux-arm64" ;;
+              armv6) echo "cloudflared-linux-arm" ;;
+              armv7) echo "cloudflared-linux-armhf" ;;
+            esac
+          }
+
+          asset_checksum() {
+            local asset_name="$1"
+            jq -r --arg name "${asset_name}" '.assets[] | select(.name == $name) | .digest' <<<"${release_json}" | sed 's/^sha256://'
+          }
+
+          asset_url() {
+            local asset_name="$1"
+            jq -r --arg name "${asset_name}" '.assets[] | select(.name == $name) | .browser_download_url' <<<"${release_json}"
+          }
+
+          raw_manifest="$(docker buildx imagetools inspect --raw "${RUNTIME_IMAGE}")"
+          digest_for() {
+            local arch="$1"
+            local variant="$2"
+            jq -r --arg arch "${arch}" --arg variant "${variant}" '
+              .manifests[]
+              | select(.platform.os == "linux")
+              | select(.platform.architecture == $arch)
+              | select((.platform.variant // "") == $variant)
+              | .digest
+            ' <<<"${raw_manifest}" | head -n1
+          }
+
+          runtime_digest_amd64="$(digest_for amd64 "")"
+          runtime_digest_arm64="$(digest_for arm64 "v8")"
+          runtime_digest_armv6="$(digest_for arm "v6")"
+          runtime_digest_armv7="$(digest_for arm "v7")"
+
+          checksum_amd64="$(asset_checksum "$(asset_name_for amd64)")"
+          checksum_arm64="$(asset_checksum "$(asset_name_for arm64)")"
+          checksum_armv6="$(asset_checksum "$(asset_name_for armv6)")"
+          checksum_armv7="$(asset_checksum "$(asset_name_for armv7)")"
+
+          fingerprint_source="$(cat <<EOF
+          type=cloudflared
+          logical_tag=${target_version}
+          upstream_repo=${UPSTREAM_REPO}
+          upstream_ref=${target_version}
+          asset_checksum_amd64=${checksum_amd64}
+          asset_checksum_arm64=${checksum_arm64}
+          asset_checksum_armv6=${checksum_armv6}
+          asset_checksum_armv7=${checksum_armv7}
+          runtime_image=${RUNTIME_IMAGE}
+          runtime_digest_amd64=${runtime_digest_amd64}
+          runtime_digest_arm64=${runtime_digest_arm64}
+          runtime_digest_armv6=${runtime_digest_armv6}
+          runtime_digest_armv7=${runtime_digest_armv7}
+          build_policy_version=${BUILD_POLICY_VERSION}
+          EOF
+          )"
+          expected_fingerprint="$(printf '%s' "${fingerprint_source}" | sha256sum | awk '{print $1}')"
+
+          current_fingerprint=""
+          if docker pull "${image_repo}:${target_version}-amd64" >/dev/null 2>&1; then
+            current_fingerprint="$(docker image inspect "${image_repo}:${target_version}-amd64" --format '{{ index .Config.Labels "io.github.ghcr-builder.fingerprint" }}' 2>/dev/null || true)"
+          fi
+
+          needs_build=true
+          if [[ "${FORCE_REBUILD}" != "true" && -n "${current_fingerprint}" && "${current_fingerprint}" == "${expected_fingerprint}" ]]; then
+            needs_build=false
+          fi
+
+          {
+            echo "image_repo=${image_repo}"
+            echo "target_version=${target_version}"
+            echo "latest_version=${latest_version}"
+            echo "runtime_digest_amd64=${runtime_digest_amd64}"
+            echo "runtime_digest_arm64=${runtime_digest_arm64}"
+            echo "runtime_digest_armv6=${runtime_digest_armv6}"
+            echo "runtime_digest_armv7=${runtime_digest_armv7}"
+            echo "checksum_amd64=${checksum_amd64}"
+            echo "checksum_arm64=${checksum_arm64}"
+            echo "checksum_armv6=${checksum_armv6}"
+            echo "checksum_armv7=${checksum_armv7}"
+            echo "url_amd64=$(asset_url "$(asset_name_for amd64)")"
+            echo "url_arm64=$(asset_url "$(asset_name_for arm64)")"
+            echo "url_armv6=$(asset_url "$(asset_name_for armv6)")"
+            echo "url_armv7=$(asset_url "$(asset_name_for armv7)")"
+            echo "expected_fingerprint=${expected_fingerprint}"
+            echo "needs_build=${needs_build}"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Skip unchanged build
+        if: steps.plan.outputs.needs_build != 'true'
+        shell: bash
+        run: |
+          echo "Published cloudflared image fingerprint already matches the desired fingerprint."
+
+      - name: Download upstream binaries
+        if: steps.plan.outputs.needs_build == 'true'
+        shell: bash
+        env:
+          URL_AMD64: ${{ steps.plan.outputs.url_amd64 }}
+          URL_ARM64: ${{ steps.plan.outputs.url_arm64 }}
+          URL_ARMV6: ${{ steps.plan.outputs.url_armv6 }}
+          URL_ARMV7: ${{ steps.plan.outputs.url_armv7 }}
+          CHECKSUM_AMD64: ${{ steps.plan.outputs.checksum_amd64 }}
+          CHECKSUM_ARM64: ${{ steps.plan.outputs.checksum_arm64 }}
+          CHECKSUM_ARMV6: ${{ steps.plan.outputs.checksum_armv6 }}
+          CHECKSUM_ARMV7: ${{ steps.plan.outputs.checksum_armv7 }}
+        run: |
+          set -euo pipefail
+
+          download_dir="${RUNNER_TEMP}/cloudflared-downloads"
+          mkdir -p "${download_dir}"
+
+          download_one() {
+            local suffix="$1"
+            local url="$2"
+            local checksum="$3"
+            local output="${download_dir}/cloudflared-${suffix}"
+            curl -fsSL "${url}" -o "${output}"
+            echo "${checksum}  ${output}" | sha256sum --check --strict
+            chmod +x "${output}"
+          }
+
+          download_one amd64 "${URL_AMD64}" "${CHECKSUM_AMD64}"
+          download_one arm64 "${URL_ARM64}" "${CHECKSUM_ARM64}"
+          download_one armv6 "${URL_ARMV6}" "${CHECKSUM_ARMV6}"
+          download_one armv7 "${URL_ARMV7}" "${CHECKSUM_ARMV7}"
+
+      - name: Build and push arch tags
+        if: steps.plan.outputs.needs_build == 'true'
+        shell: bash
+        env:
+          IMAGE_REPO: ${{ steps.plan.outputs.image_repo }}
+          TARGET_VERSION: ${{ steps.plan.outputs.target_version }}
+          EXPECTED_FINGERPRINT: ${{ steps.plan.outputs.expected_fingerprint }}
+          RUNTIME_DIGEST_AMD64: ${{ steps.plan.outputs.runtime_digest_amd64 }}
+          RUNTIME_DIGEST_ARM64: ${{ steps.plan.outputs.runtime_digest_arm64 }}
+          RUNTIME_DIGEST_ARMV6: ${{ steps.plan.outputs.runtime_digest_armv6 }}
+          RUNTIME_DIGEST_ARMV7: ${{ steps.plan.outputs.runtime_digest_armv7 }}
+        run: |
+          set -euo pipefail
+
+          work_root="${RUNNER_TEMP}/cloudflared-build"
+          download_dir="${RUNNER_TEMP}/cloudflared-downloads"
+          mkdir -p "${work_root}"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          create_context() {
+            local suffix="$1"
+            local dir="${work_root}/${suffix}"
+            mkdir -p "${dir}"
+            cp "${download_dir}/cloudflared-${suffix}" "${dir}/cloudflared"
+            {
+              printf 'FROM %s\n' "${RUNTIME_IMAGE}"
+              printf '%s\n' 'RUN apk add --no-cache ca-certificates tzdata && rm -rf /var/cache/apk/* \'
+              printf '%s\n' '    && addgroup -S cloudflared \'
+              printf '%s\n' '    && adduser -S -G cloudflared cloudflared'
+              printf '%s\n' 'COPY cloudflared /usr/local/bin/cloudflared'
+              printf '%s\n' 'RUN chmod +x /usr/local/bin/cloudflared'
+              printf '%s\n' 'USER cloudflared'
+              printf '%s\n' 'ENTRYPOINT ["/usr/local/bin/cloudflared"]'
+            } >"${dir}/Dockerfile"
+          }
+
+          create_context amd64
+          create_context arm64
+          create_context armv6
+          create_context armv7
+
+          build_arch() {
+            local suffix="$1"
+            local platform="$2"
+            local context_dir="${work_root}/${suffix}"
+
+            docker buildx build \
+              --platform "${platform}" \
+              --file "${context_dir}/Dockerfile" \
+              --tag "${IMAGE_REPO}:${TARGET_VERSION}-${suffix}" \
+              --label "org.opencontainers.image.title=cloudflared-docker" \
+              --label "org.opencontainers.image.source=https://github.com/${UPSTREAM_REPO}" \
+              --label "org.opencontainers.image.version=${TARGET_VERSION}" \
+              --label "org.opencontainers.image.created=${build_date}" \
+              --label "io.github.ghcr-builder.upstream-repo=${UPSTREAM_REPO}" \
+              --label "io.github.ghcr-builder.upstream-ref=${TARGET_VERSION}" \
+              --label "io.github.ghcr-builder.build-policy-version=${BUILD_POLICY_VERSION}" \
+              --label "io.github.ghcr-builder.runtime-base-image=${RUNTIME_IMAGE}" \
+              --label "io.github.ghcr-builder.runtime-base-digest-amd64=${RUNTIME_DIGEST_AMD64}" \
+              --label "io.github.ghcr-builder.runtime-base-digest-arm64=${RUNTIME_DIGEST_ARM64}" \
+              --label "io.github.ghcr-builder.runtime-base-digest-armv6=${RUNTIME_DIGEST_ARMV6}" \
+              --label "io.github.ghcr-builder.runtime-base-digest-armv7=${RUNTIME_DIGEST_ARMV7}" \
+              --label "io.github.ghcr-builder.fingerprint=${EXPECTED_FINGERPRINT}" \
+              --provenance=false \
+              --sbom=false \
+              --push \
+              "${context_dir}"
+          }
+
+          build_arch amd64 linux/amd64
+          build_arch arm64 linux/arm64
+          build_arch armv6 linux/arm/v6
+          build_arch armv7 linux/arm/v7
+
+      - name: Verify arch tags
+        if: steps.plan.outputs.needs_build == 'true'
+        shell: bash
+        env:
+          IMAGE_REPO: ${{ steps.plan.outputs.image_repo }}
+          TARGET_VERSION: ${{ steps.plan.outputs.target_version }}
+        run: |
+          set -euo pipefail
+
+          docker run --rm --platform linux/amd64 "${IMAGE_REPO}:${TARGET_VERSION}-amd64" version
+          docker run --rm --platform linux/arm64 "${IMAGE_REPO}:${TARGET_VERSION}-arm64" version
+          docker run --rm --platform linux/arm/v6 "${IMAGE_REPO}:${TARGET_VERSION}-armv6" version
+          docker run --rm --platform linux/arm/v7 "${IMAGE_REPO}:${TARGET_VERSION}-armv7" version
+
+      - name: Publish version and latest manifests
+        if: steps.plan.outputs.needs_build == 'true'
+        shell: bash
+        env:
+          IMAGE_REPO: ${{ steps.plan.outputs.image_repo }}
+          TARGET_VERSION: ${{ steps.plan.outputs.target_version }}
+          LATEST_VERSION: ${{ steps.plan.outputs.latest_version }}
+        run: |
+          set -euo pipefail
+
+          docker buildx imagetools create \
+            --tag "${IMAGE_REPO}:${TARGET_VERSION}" \
+            "${IMAGE_REPO}:${TARGET_VERSION}-amd64" \
+            "${IMAGE_REPO}:${TARGET_VERSION}-arm64" \
+            "${IMAGE_REPO}:${TARGET_VERSION}-armv6" \
+            "${IMAGE_REPO}:${TARGET_VERSION}-armv7"
+
+          if [[ "${TARGET_VERSION}" == "${LATEST_VERSION}" ]]; then
+            docker buildx imagetools create \
+              --tag "${IMAGE_REPO}:latest" \
+              "${IMAGE_REPO}:${TARGET_VERSION}-amd64" \
+              "${IMAGE_REPO}:${TARGET_VERSION}-arm64" \
+              "${IMAGE_REPO}:${TARGET_VERSION}-armv6" \
+              "${IMAGE_REPO}:${TARGET_VERSION}-armv7"
+          fi
