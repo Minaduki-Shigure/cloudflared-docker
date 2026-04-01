@@ -1,4 +1,4 @@
-name: Build Cloudflared Docker
+name: Build Cloudflared
 
 on:
   schedule:
@@ -53,7 +53,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          image_repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/cloudflared-docker"
+          image_repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/cloudflared"
           api_root="https://api.github.com/repos/${UPSTREAM_REPO}/releases"
 
           latest_json="$(curl -fsSL -H 'Accept: application/vnd.github+json' "${api_root}/latest")"
@@ -248,7 +248,7 @@ jobs:
               --platform "${platform}" \
               --file "${context_dir}/Dockerfile" \
               --tag "${IMAGE_REPO}:${TARGET_VERSION}-${suffix}" \
-              --label "org.opencontainers.image.title=cloudflared-docker" \
+              --label "org.opencontainers.image.title=cloudflared" \
               --label "org.opencontainers.image.source=https://github.com/${UPSTREAM_REPO}" \
               --label "org.opencontainers.image.version=${TARGET_VERSION}" \
               --label "org.opencontainers.image.created=${build_date}" \
